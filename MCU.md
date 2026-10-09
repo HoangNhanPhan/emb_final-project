@@ -4,6 +4,7 @@
 Dự án này là firmware cho ESP32 dùng để:
 - đọc nhiệt độ và độ ẩm từ cảm biến AHT25
 - điều khiển quạt theo chế độ tự động/manual
+- điều khiển quạt theo Auto, Remote, Operator và Emergency
 - giám sát trạng thái hệ thống và an toàn
 - giao tiếp WiFi/MQTT
 - xử lý trạng thái hệ thống theo state machine
@@ -38,14 +39,18 @@ Dự án này là firmware cho ESP32 dùng để:
 5. Dựa trên mode hệ thống:
    - INIT_MODE
    - AUTO_MODE
-   - MANUAL_MODE
+   - REMOTE_MODE
+   - OPERATOR_MODE
    - EMERGENCY_MODE
-   - SAFE_MODE
 6. Publish dữ liệu và nhận lệnh từ MQTT.
 
 ## 4. Ghi chú kỹ thuật
 - Cảm biến đang dùng: AHT25
-- Hệ thống có hỗ trợ trạng thái tự động và manual
+- Hệ thống có các trạng thái Auto, Remote, Operator và Emergency
+- Operator mode dùng biến trở GPIO34 (ADC 12-bit) ánh xạ trực tiếp sang PWM 10-bit, có deadband 16 count và timeout 30 giây
+- Operator mode dùng biến trở GPIO34 (ADC 12-bit) ánh xạ trực tiếp sang PWM 10-bit, có deadband 16 count và timeout 30 giây
+- Nút Activate nối GPIO33-GND; nút toggle ON/OFF nối GPIO32-GND. Cả hai chân dùng INPUT_PULLUP và nút nhấn mức LOW.
+- Remote mode nhận duty từ App qua MQTT; App có thể Activate Operator hoặc trả hệ thống về Auto
 - MQTT dùng để điều khiển từ xa và telemetry
 - Tính an toàn có watchdog/emergency logic
 

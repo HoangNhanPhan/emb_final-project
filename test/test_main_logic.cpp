@@ -22,7 +22,8 @@ void applyModeAction_test(SystemMode_t mode) {
         case AUTO_MODE:
             sys.fan_duty_pct = 50; // Simplified
             break;
-        case MANUAL_MODE:
+        case REMOTE_MODE:
+        case OPERATOR_MODE:
             sys.fan_duty_pct = 75; // Simplified
             break;
         case EMERGENCY_MODE:
@@ -62,12 +63,15 @@ void test_stateMachine_transitions(void) {
     TEST_ASSERT_EQUAL_UINT8(AUTO_MODE, sys.current_mode);
     TEST_ASSERT_EQUAL_UINT8(50, sys.fan_duty_pct); // From applyModeAction_test
     
-    // Test AUTO_MODE -> MANUAL_MODE transition
-    setSystemMode_test(MANUAL_MODE);
-    TEST_ASSERT_EQUAL_UINT8(MANUAL_MODE, sys.current_mode);
+    // Test AUTO_MODE -> REMOTE_MODE -> OPERATOR_MODE transitions
+    setSystemMode_test(REMOTE_MODE);
+    TEST_ASSERT_EQUAL_UINT8(REMOTE_MODE, sys.current_mode);
     TEST_ASSERT_EQUAL_UINT8(75, sys.fan_duty_pct); // From applyModeAction_test
+
+    setSystemMode_test(OPERATOR_MODE);
+    TEST_ASSERT_EQUAL_UINT8(OPERATOR_MODE, sys.current_mode);
     
-    // Test MANUAL_MODE -> EMERGENCY_MODE transition
+    // Test OPERATOR_MODE -> EMERGENCY_MODE transition
     setSystemMode_test(EMERGENCY_MODE);
     TEST_ASSERT_EQUAL_UINT8(EMERGENCY_MODE, sys.current_mode);
     TEST_ASSERT_EQUAL_UINT8(100, sys.fan_duty_pct); // From applyModeAction_test
@@ -112,21 +116,21 @@ void test_SensorData_t_validData(void) {
     TEST_ASSERT_TRUE(data.valid);
 }
 
-void test_ManualCommand_t(void) {
-    // Test ManualCommand_t
-    ManualCommand_t cmd = {75, 12345};
+void test_ControlCommand_t(void) {
+    ControlCommand_t cmd = {75, 12345, COMMAND_SET_REMOTE_DUTY};
     
     TEST_ASSERT_EQUAL_UINT8(75, cmd.duty_pct);
     TEST_ASSERT_EQUAL_UINT32(12345, cmd.timestamp_ms);
+    TEST_ASSERT_EQUAL_UINT8(COMMAND_SET_REMOTE_DUTY, cmd.type);
 }
 
-void test_ManualCommand_t_clamping(void) {
+void test_ControlCommand_t_clamping(void) {
     // Test that duty cycle values are clamped (conceptually)
     // In real code, this happens in MQTT handler, but we can test the concept
-    ManualCommand_t cmd1 = {0, 0};    // Minimum
-    ManualCommand_t cmd2 = {100, 0};  // Maximum
-    ManualCommand_t cmd3 = {150, 0};  // Would be clamped to 100
-    ManualCommand_t cmd4 = {-10, 0};  // Would be clamped to 0
+    ControlCommand_t cmd1 = {0, 0, COMMAND_SET_REMOTE_DUTY};    // Minimum
+    ControlCommand_t cmd2 = {100, 0, COMMAND_SET_REMOTE_DUTY};  // Maximum
+    ControlCommand_t cmd3 = {150, 0, COMMAND_SET_REMOTE_DUTY};  // Would be clamped to 100
+    ControlCommand_t cmd4 = {-10, 0, COMMAND_SET_REMOTE_DUTY};  // Would be clamped to 0
     
     TEST_ASSERT_EQUAL_UINT8(0, cmd1.duty_pct);
     TEST_ASSERT_EQUAL_UINT8(100, cmd2.duty_pct);
@@ -138,8 +142,9 @@ void test_SystemMode_t_enumValues(void) {
     // Test that enum values are as expected
     TEST_ASSERT_EQUAL_UINT8(0, INIT_MODE);
     TEST_ASSERT_EQUAL_UINT8(1, AUTO_MODE);
-    TEST_ASSERT_EQUAL_UINT8(2, MANUAL_MODE);
-    TEST_ASSERT_EQUAL_UINT8(3, EMERGENCY_MODE);
+    TEST_ASSERT_EQUAL_UINT8(2, REMOTE_MODE);
+    TEST_ASSERT_EQUAL_UINT8(3, OPERATOR_MODE);
+    TEST_ASSERT_EQUAL_UINT8(4, EMERGENCY_MODE);
 }
 
 void run_main_logic_tests(void) {
@@ -148,7 +153,7 @@ void run_main_logic_tests(void) {
     RUN_TEST(test_stateMachine_noChange);
     RUN_TEST(test_SensorData_t_init);
     RUN_TEST(test_SensorData_t_validData);
-    RUN_TEST(test_ManualCommand_t);
-    RUN_TEST(test_ManualCommand_t_clamping);
+    RUN_TEST(test_ControlCommand_t);
+    RUN_TEST(test_ControlCommand_t_clamping);
     RUN_TEST(test_SystemMode_t_enumValues);
 }

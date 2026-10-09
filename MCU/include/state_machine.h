@@ -12,7 +12,8 @@
 typedef enum {
     INIT_MODE = 0,      // Giai đoạn khởi tạo ban đầu: I2C, PWM, queue, timer và mạng đang setup.
     AUTO_MODE,          // Chế độ mặc định: quạt điều khiển theo nhiệt độ cảm biến và gửi telemetry.
-    MANUAL_MODE,        // Chế độ người dùng điều khiển quạt thủ công qua MQTT hoặc lệnh ngoại vi.
+    REMOTE_MODE,        // App điều khiển setpoint quạt qua MQTT.
+    OPERATOR_MODE,      // App kích hoạt; biến trở ADC điều khiển PWM trực tiếp.
     EMERGENCY_MODE      // Chế độ khẩn cấp khi vượt ngưỡng nguy hiểm, ưu tiên cao nhất.
 } SystemMode_t;
 
@@ -28,13 +29,21 @@ typedef struct {
 } SensorData_t;
 
 // -----------------------------------------------------------------------------
-// Cấu trúc dữ liệu lệnh điều khiển thủ công.
-// Dù được truyền qua MQTT hoặc điểm điều khiển khác, dạng dữ liệu này phải nhất quán cho mọi task.
+// Cấu trúc command điều khiển từ App qua MQTT.
 // -----------------------------------------------------------------------------
 typedef struct {
     int duty_pct;           // Mức duty quạt được clamp tại runtime và có thể tạm thời âm trong test.
     uint32_t timestamp_ms;  // Thời gian nhận lệnh để tính timeout và ưu tiên trong manual mode.
-} ManualCommand_t;
+    uint8_t type;
+} ControlCommand_t;
+
+typedef enum {
+    COMMAND_SET_REMOTE_DUTY = 0,
+    COMMAND_ACTIVATE_OPERATOR,
+    COMMAND_RETURN_AUTO,
+    COMMAND_OPERATOR_ON,
+    COMMAND_OPERATOR_OFF
+} CommandType_t;
 
 // -----------------------------------------------------------------------------
 // Cấu trúc toàn trạng thái hệ thống hiện tại.
@@ -49,7 +58,6 @@ typedef struct {
     volatile bool        last_sensor_valid;
     volatile uint16_t    fan_rpm;
     volatile float       target_temp_c;
-    volatile bool        manual_via_switch;
 } SystemContext_t;
 
 #endif // STATE_MACHINE_H

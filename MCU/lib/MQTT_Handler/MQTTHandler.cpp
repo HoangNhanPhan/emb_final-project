@@ -117,7 +117,7 @@ bool MQTTHandler::hasCommand() const {
 }
 
 // getCommand(): trả về lệnh pending và đặt cờ commandAvailable về false để không đọc lặp lại.
-ManualCommand_t MQTTHandler::getCommand() {
+ControlCommand_t MQTTHandler::getCommand() {
     _commandAvailable = false;
     return _pendingCommand;
 }
@@ -190,7 +190,7 @@ void MQTTHandler::mqttCallback(char* topic, byte* payload, unsigned int length) 
     Serial.println(payloadString);
 
     if (String(topic) == _commandTopic) {
-        ManualCommand_t cmd;
+        ControlCommand_t cmd = {};
         if (parseCommandJson(payloadString, cmd)) {
             _pendingCommand = cmd;
             _commandAvailable = true;
@@ -234,8 +234,11 @@ String MQTTHandler::createTelemetryJson(const SensorData_t &data,
         case AUTO_MODE:
             modeName = "AUTO";
             break;
-        case MANUAL_MODE:
-            modeName = "MANUAL";
+        case REMOTE_MODE:
+            modeName = "REMOTE";
+            break;
+        case OPERATOR_MODE:
+            modeName = "OPERATOR";
             break;
         case EMERGENCY_MODE:
             modeName = "EMERGENCY";
@@ -263,8 +266,9 @@ String MQTTHandler::createTelemetryJson(const SensorData_t &data,
     return String(jsonBuffer, n);
 }
 
-// parseCommandJson(): đọc JSON nhận được từ topic command và chuyển thành ManualCommand_t an toàn.
-bool MQTTHandler::parseCommandJson(const String &jsonString, ManualCommand_t &cmd) {
+// parseCommandJson(): parse Remote duty values and Operator actions from App commands.
+bool MQTTHandler::parseCommandJson(const String &jsonString, ControlCommand_t &cmd) {
+    cmd.duty_pct = 0;
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, jsonString);
 
@@ -274,13 +278,27 @@ bool MQTTHandler::parseCommandJson(const String &jsonString, ManualCommand_t &cm
         return false;
     }
 
-    if (!doc["duty"].is<int>()) {
-        Serial.println("JSON missing 'duty' field");
+    if (doc["action"].is<const char *>()) {
+        const String action = doc["action"].as<const char *>();
+        if (action == "activate") {
+            cmd.type = COMMAND_ACTIVATE_OPERATOR;
+        } else if (action == "auto") {
+            cmd.type = COMMAND_RETURN_AUTO;
+        } else if (action == "on") {
+            cmd.type = COMMAND_OPERATOR_ON;
+        } else if (action == "off") {
+            cmd.type = COMMAND_OPERATOR_OFF;
+        } else {
+            return false;
+        }
+    } else if (doc["duty"].is<int>()) {
+        const int dutyRaw = doc["duty"].as<int>();
+        cmd.type = COMMAND_SET_REMOTE_DUTY;
+        cmd.duty_pct = constrain(dutyRaw, 0, 100);
+    } else {
+        Serial.println("JSON requires 'action' or 'duty' field");
         return false;
     }
-
-    int dutyRaw = doc["duty"].as<int>();
-    cmd.duty_pct = static_cast<uint8_t>(constrain(dutyRaw, 0, 100));
     cmd.timestamp_ms = millis();
 
     return true;

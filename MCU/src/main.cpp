@@ -46,11 +46,15 @@ static SystemContext_t g_sys = {
     .last_sensor_valid = false,
     .fan_rpm = 0,
     .target_temp_c = TARGET_TEMP_DEFAULT_C,
-    .manual_via_switch = false,
 };
 
 static volatile uint32_t g_tachPulseCount = 0;
 static volatile uint32_t g_lastTachPulseMs = 0;
+static portMUX_TYPE g_operatorButtonMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool g_operatorButtonPressed = false;
+static volatile uint32_t g_operatorButtonLastMs = 0;
+static volatile bool g_operatorActivatePressed = false;
+static volatile uint32_t g_operatorActivateLastMs = 0;
 
 // Đối tượng MQTT dùng để kết nối WiFi/MQTT và nhận lệnh điều khiển từ xa.
 static MQTTHandler mqttHandler;
@@ -62,6 +66,26 @@ static void IRAM_ATTR gpio_isr_handler() {
     g_tachPulseCount++;
     g_lastTachPulseMs = millis();
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+static void IRAM_ATTR operatorButton_isr() {
+    const uint32_t nowMs = millis();
+    portENTER_CRITICAL_ISR(&g_operatorButtonMux);
+    if (nowMs - g_operatorButtonLastMs >= 200UL) {
+        g_operatorButtonPressed = true;
+        g_operatorButtonLastMs = nowMs;
+    }
+    portEXIT_CRITICAL_ISR(&g_operatorButtonMux);
+}
+
+static void IRAM_ATTR operatorActivate_isr() {
+    const uint32_t nowMs = millis();
+    portENTER_CRITICAL_ISR(&g_operatorButtonMux);
+    if (nowMs - g_operatorActivateLastMs >= 200UL) {
+        g_operatorActivatePressed = true;
+        g_operatorActivateLastMs = nowMs;
+    }
+    portEXIT_CRITICAL_ISR(&g_operatorButtonMux);
 }
 }
 
@@ -75,7 +99,7 @@ void setup() {
     // Tạo queue gửi dữ liệu cảm biến mới nhất và lệnh điều khiển manual từ MQTT.
     sensorQueue = xQueueCreate(1, sizeof(SensorData_t));
     telemetryQueue = xQueueCreate(1, sizeof(SensorData_t));
-    cmdQueue = xQueueCreate(CMD_QUEUE_LEN, sizeof(ManualCommand_t));
+    cmdQueue = xQueueCreate(CMD_QUEUE_LEN, sizeof(ControlCommand_t));
     sysEvents = xEventGroupCreate();
     i2cMutex = xSemaphoreCreateMutex();
 
@@ -87,8 +111,8 @@ void setup() {
 
     // Timer dùng để tự động quay lại AUTO_MODE nếu không có lệnh manual mới trong thời gian quy định.
     manualTimer = xTimerCreate(
-        "manualTimeout",
-        pdMS_TO_TICKS(MANUAL_TIMEOUT_MS),
+        "operatorTimeout",
+        pdMS_TO_TICKS(OPERATOR_TIMEOUT_MS),
         pdFALSE,
         (void *)0,
         manualTimeoutCallback);
@@ -127,13 +151,15 @@ static void initHardware(void) {
     ledcAttachPin(PIN_FAN_PWM, LEDC_FAN_CHANNEL);
     ledcWrite(LEDC_FAN_CHANNEL, 0);
 
-    // Tachometer quạt và các switch mức dùng pull-up nội để đọc tín hiệu đầu vào.
+    // Tachometer và biến trở Operator.
     pinMode(PIN_FAN_TACH, INPUT_PULLUP);
-    pinMode(PIN_SWITCH_LEVEL_0, INPUT_PULLUP);
-    pinMode(PIN_SWITCH_LEVEL_33, INPUT_PULLUP);
-    pinMode(PIN_SWITCH_LEVEL_66, INPUT_PULLUP);
-    pinMode(PIN_SWITCH_LEVEL_100, INPUT_PULLUP);
+    pinMode(PIN_OPERATOR_TOGGLE, INPUT_PULLUP);
+    pinMode(PIN_OPERATOR_ACTIVATE, INPUT_PULLUP);
+    analogReadResolution(12);
+    analogSetPinAttenuation(PIN_OPERATOR_POT, ADC_11db);
     attachInterrupt(digitalPinToInterrupt(PIN_FAN_TACH), gpio_isr_handler, FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_OPERATOR_TOGGLE), operatorButton_isr, FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_OPERATOR_ACTIVATE), operatorActivate_isr, FALLING);
 
     // WDT ESP32 được khởi tạo để phát hiện task treo hoặc nhầm lẫn trong vòng lặp.
     esp_task_wdt_init(WDT_TIMEOUT_S, true);
@@ -162,7 +188,8 @@ static void applyModeAction(SystemMode_t mode) {
         case AUTO_MODE:
             break;
 
-        case MANUAL_MODE:
+        case REMOTE_MODE:
+        case OPERATOR_MODE:
             break;
 
         case EMERGENCY_MODE:
@@ -178,7 +205,7 @@ static void applyModeAction(SystemMode_t mode) {
 static void manualTimeoutCallback(TimerHandle_t xTimer) {
     (void)xTimer;
     if (sysEvents != nullptr) {
-        xEventGroupSetBits(sysEvents, EVT_MANUAL_TIMEOUT);
+           xEventGroupSetBits(sysEvents, EVT_OPERATOR_TIMEOUT);
     }
 }
 
@@ -250,59 +277,101 @@ static void Task_SensorRead(void *pvParameters) {
 static void Task_FanControl(void *pvParameters) {
     (void)pvParameters;
     SensorData_t data;
-    ManualCommand_t manualCmd;
+    ControlCommand_t command;
 
     static uint32_t lastPIDTime = 0;
     static float targetTemp = TARGET_TEMP_DEFAULT_C;
     static float emaRpm = 0.0f;
+    static uint16_t acceptedOperatorAdc = 0;
+    static uint32_t operatorPwmValue = 0;
+    static bool operatorAdcInitialized = false;
+    static bool operatorEnabled = true;
     g_sys.target_temp_c = targetTemp;
 
     for (;;) {
         EventBits_t bits = xEventGroupGetBits(sysEvents);
-        int manualSwPct = -1;
-        if (digitalRead(PIN_SWITCH_LEVEL_0) == LOW) {
-            manualSwPct = 0;
-        } else if (digitalRead(PIN_SWITCH_LEVEL_33) == LOW) {
-            manualSwPct = 33;
-        } else if (digitalRead(PIN_SWITCH_LEVEL_66) == LOW) {
-            manualSwPct = 66;
-        } else if (digitalRead(PIN_SWITCH_LEVEL_100) == LOW) {
-            manualSwPct = 100;
-        }
-
-        // Emergency has priority; physical switches override MQTT manual commands.
         if (bits & EVT_EMERGENCY) {
             setSystemMode(EMERGENCY_MODE);
-            g_sys.fan_duty_pct = 50;
-        } else if (manualSwPct >= 0) {
-            setSystemMode(MANUAL_MODE);
-            g_sys.manual_via_switch = true;
-            g_sys.fan_duty_pct = (uint8_t)manualSwPct;
+            g_sys.fan_duty_pct = 100;
+        } else if (bits & EVT_OPERATOR_TIMEOUT) {
+            setSystemMode(AUTO_MODE);
+            g_sys.fan_duty_pct = 0;
+            operatorAdcInitialized = false;
+            xEventGroupClearBits(sysEvents, EVT_OPERATOR_TIMEOUT | EVT_OPERATOR_ACTIVE);
             xTimerStop(manualTimer, 0);
-            xEventGroupClearBits(sysEvents, EVT_MANUAL_TIMEOUT);
-        } else if (g_sys.current_mode == MANUAL_MODE && g_sys.manual_via_switch) {
-            g_sys.manual_via_switch = false;
+        } else if (g_sys.current_mode == REMOTE_MODE &&
+                   (!(bits & EVT_NETWORK_READY) || (bits & EVT_SENSOR_TIMEOUT))) {
             setSystemMode(AUTO_MODE);
-        } else if (bits & EVT_SENSOR_TIMEOUT) {
-            g_sys.manual_via_switch = false;
-            setSystemMode(AUTO_MODE);
-            xEventGroupClearBits(sysEvents, EVT_SENSOR_TIMEOUT);
-        } else if (bits & EVT_MANUAL_TIMEOUT) {
-            g_sys.manual_via_switch = false;
-            setSystemMode(AUTO_MODE);
-            xEventGroupClearBits(sysEvents, EVT_MANUAL_TIMEOUT);
+            g_sys.fan_duty_pct = 0;
         } else if (g_sys.current_mode == INIT_MODE) {
             setSystemMode(AUTO_MODE);
         }
 
-        if (manualSwPct >= 0) {
-            while (xQueueReceive(cmdQueue, &manualCmd, 0) == pdTRUE) {
+        bool operatorActivatePressed;
+        portENTER_CRITICAL(&g_operatorButtonMux);
+        operatorActivatePressed = g_operatorActivatePressed;
+        g_operatorActivatePressed = false;
+        portEXIT_CRITICAL(&g_operatorButtonMux);
+        if (operatorActivatePressed &&
+            (g_sys.current_mode == AUTO_MODE || g_sys.current_mode == REMOTE_MODE)) {
+            setSystemMode(OPERATOR_MODE);
+            operatorEnabled = true;
+            operatorAdcInitialized = false;
+            xEventGroupClearBits(sysEvents, EVT_OPERATOR_TIMEOUT);
+            xEventGroupSetBits(sysEvents, EVT_OPERATOR_ACTIVE);
+            xTimerReset(manualTimer, portMAX_DELAY);
+            xTimerStart(manualTimer, portMAX_DELAY);
+        }
+
+        if (g_sys.current_mode == EMERGENCY_MODE) {
+            while (xQueueReceive(cmdQueue, &command, 0) == pdTRUE) {
             }
-        } else if (g_sys.current_mode != EMERGENCY_MODE &&
-                   xQueueReceive(cmdQueue, &manualCmd, 0) == pdTRUE) {
-            setSystemMode(MANUAL_MODE);
-            g_sys.manual_via_switch = false;
-            g_sys.fan_duty_pct = (uint8_t)constrain(manualCmd.duty_pct, 0, 100);
+        } else if (xQueueReceive(cmdQueue, &command, 0) == pdTRUE) {
+            switch ((CommandType_t)command.type) {
+                case COMMAND_SET_REMOTE_DUTY:
+                    if (g_sys.current_mode == AUTO_MODE || g_sys.current_mode == REMOTE_MODE) {
+                        setSystemMode(REMOTE_MODE);
+                        g_sys.fan_duty_pct = (uint8_t)constrain(command.duty_pct, 0, 100);
+                        operatorAdcInitialized = false;
+                        xTimerStop(manualTimer, 0);
+                    }
+                    break;
+                case COMMAND_ACTIVATE_OPERATOR:
+                    if (g_sys.current_mode == AUTO_MODE || g_sys.current_mode == REMOTE_MODE) {
+                        setSystemMode(OPERATOR_MODE);
+                        operatorEnabled = true;
+                        operatorAdcInitialized = false;
+                        xEventGroupClearBits(sysEvents, EVT_OPERATOR_TIMEOUT);
+                        xEventGroupSetBits(sysEvents, EVT_OPERATOR_ACTIVE);
+                        xTimerReset(manualTimer, portMAX_DELAY);
+                        xTimerStart(manualTimer, portMAX_DELAY);
+                    }
+                    break;
+                case COMMAND_RETURN_AUTO:
+                    setSystemMode(AUTO_MODE);
+                    g_sys.fan_duty_pct = 0;
+                    operatorAdcInitialized = false;
+                    xTimerStop(manualTimer, 0);
+                    xEventGroupClearBits(sysEvents, EVT_OPERATOR_ACTIVE | EVT_OPERATOR_TIMEOUT);
+                    break;
+                case COMMAND_OPERATOR_ON:
+                case COMMAND_OPERATOR_OFF:
+                    if (g_sys.current_mode == OPERATOR_MODE) {
+                        operatorEnabled = command.type == COMMAND_OPERATOR_ON;
+                        xTimerReset(manualTimer, portMAX_DELAY);
+                        xTimerStart(manualTimer, portMAX_DELAY);
+                    }
+                    break;
+            }
+        }
+
+        bool operatorButtonPressed;
+        portENTER_CRITICAL(&g_operatorButtonMux);
+        operatorButtonPressed = g_operatorButtonPressed;
+        g_operatorButtonPressed = false;
+        portEXIT_CRITICAL(&g_operatorButtonMux);
+        if (g_sys.current_mode == OPERATOR_MODE && operatorButtonPressed) {
+            operatorEnabled = !operatorEnabled;
             xTimerReset(manualTimer, portMAX_DELAY);
             xTimerStart(manualTimer, portMAX_DELAY);
         }
@@ -312,12 +381,19 @@ static void Task_FanControl(void *pvParameters) {
             g_sys.fan_duty_pct > FAN_STALL_DUTY_PCT &&
             (nowMs - g_lastTachPulseMs) > 2000UL) {
             setSystemMode(EMERGENCY_MODE);
-            g_sys.fan_duty_pct = 50;
+            g_sys.fan_duty_pct = 100;
             xEventGroupSetBits(sysEvents, EVT_EMERGENCY);
         }
 
         if (g_sys.current_mode == EMERGENCY_MODE) {
-            g_sys.fan_duty_pct = 50;
+            g_sys.fan_duty_pct = 100;
+            if (g_sys.last_sensor_valid && g_sys.last_temperature_c <= TEMP_MIN_C &&
+                g_sys.last_humidity_pct <= HUM_CRITICAL_HIGH &&
+                g_sys.last_humidity_pct >= HUM_CRITICAL_LOW) {
+                xEventGroupClearBits(sysEvents, EVT_EMERGENCY);
+                setSystemMode(AUTO_MODE);
+                g_sys.fan_duty_pct = 0;
+            }
         }
 
         noInterrupts();
@@ -330,50 +406,46 @@ static void Task_FanControl(void *pvParameters) {
         emaRpm = EMA_ALPHA * boundedRpm + (1.0f - EMA_ALPHA) * emaRpm;
         g_sys.fan_rpm = (uint16_t)emaRpm;
 
-        // Nếu có dữ liệu cảm biến mới, tiến hành tính toán duty cycle theo mode hiện tại.
-        if (xQueueReceive(sensorQueue, &data, 0) == pdTRUE && data.valid) {
-            if (millis() - lastPIDTime >= 200) {
-                lastPIDTime = millis();
-
-                switch (g_sys.current_mode) {
-                    case AUTO_MODE: {
-                        const float temperatureDelta = data.temperature_c - targetTemp;
-                        const float requestedDuty = temperatureDelta * FAN_DUTY_PER_DEGREE_PCT;
-
-                        uint8_t duty;
-                        if (requestedDuty <= 0.5f) {
-                            duty = 0;  // Không cần làm mát -> tắt quạt.
-                        } else if (requestedDuty < FAN_STALL_DUTY_PCT) {
-                            duty = FAN_STALL_DUTY_PCT;  // Ép mức tối thiểu để quạt không dừng do stall.
-                        } else {
-                            duty = (uint8_t)constrain(requestedDuty, 0.0f, 100.0f);
-                        }
-
-                        g_sys.fan_duty_pct = duty;
-                        break;
-                    }
-
-                    case MANUAL_MODE:
-                        break;
-
-                    case EMERGENCY_MODE:
-                        g_sys.fan_duty_pct = 50;
-                        break;
-
-                    case INIT_MODE:
-                    default:
-                        g_sys.fan_duty_pct = 0;
-                        break;
-                }
+        if (xQueueReceive(sensorQueue, &data, 0) == pdTRUE && data.valid &&
+            millis() - lastPIDTime >= 200 && g_sys.current_mode == AUTO_MODE) {
+            lastPIDTime = millis();
+            const float temperatureDelta = data.temperature_c - targetTemp;
+            const float requestedDuty = temperatureDelta * FAN_DUTY_PER_DEGREE_PCT;
+            uint8_t duty;
+            if (requestedDuty <= 0.5f) {
+                duty = 0;
+            } else if (requestedDuty < FAN_STALL_DUTY_PCT) {
+                duty = FAN_STALL_DUTY_PCT;
+            } else {
+                duty = (uint8_t)constrain(requestedDuty, 0.0f, 100.0f);
             }
+            g_sys.fan_duty_pct = duty;
         }
 
-        // Chuyển duty percentage sang giá trị PWM chuẩn của ESP32 để điều khiển quạt.
-        const uint8_t duty = g_sys.fan_duty_pct;
         const uint32_t pwmMax = (1UL << LEDC_FAN_RESOLUTION) - 1UL;
-        const uint32_t pwmValue = duty == 0
-                          ? 0
-                          : (uint32_t)map(duty, 0, 100, 0, (int)pwmMax);
+        uint32_t pwmValue;
+        if (g_sys.current_mode == OPERATOR_MODE) {
+            const uint16_t adcValue = (uint16_t)constrain(
+                analogRead(PIN_OPERATOR_POT), 0, (int)OPERATOR_ADC_MAX);
+            const uint16_t adcDelta = adcValue > acceptedOperatorAdc
+                ? adcValue - acceptedOperatorAdc
+                : acceptedOperatorAdc - adcValue;
+            if (!operatorAdcInitialized || adcDelta >= OPERATOR_ADC_DEADBAND) {
+                acceptedOperatorAdc = adcValue;
+                operatorPwmValue = (uint32_t)map(
+                    adcValue, 0, OPERATOR_ADC_MAX, 0, (long)pwmMax);
+                operatorAdcInitialized = true;
+                xTimerReset(manualTimer, portMAX_DELAY);
+                xTimerStart(manualTimer, portMAX_DELAY);
+            }
+            pwmValue = operatorEnabled ? operatorPwmValue : 0;
+            g_sys.fan_duty_pct = (uint8_t)((pwmValue * 100UL) / pwmMax);
+        } else {
+            const uint8_t duty = g_sys.fan_duty_pct;
+            pwmValue = duty == 0
+                ? 0
+                : (uint32_t)map(duty, 0, 100, 0, (int)pwmMax);
+        }
         ledcWrite(LEDC_FAN_CHANNEL, pwmValue);
 
         vTaskDelay(pdMS_TO_TICKS(FAN_UPDATE_PERIOD_MS));
@@ -409,12 +481,12 @@ static void Task_Network(void *pvParameters) {
             }
         }
 
-        // Queue MQTT commands; FanControl applies them after checking physical switches.
+        // Queue App commands for FanControl.
         if (mqttHandler.hasCommand()) {
-            ManualCommand_t cmd = mqttHandler.getCommand();
+            ControlCommand_t cmd = mqttHandler.getCommand();
             if (xQueueSend(cmdQueue, &cmd, 0) == pdTRUE) {
-                xEventGroupSetBits(sysEvents, EVT_MANUAL_ACTIVE);
-                Serial.printf("Manual command received: duty=%u%%\n", cmd.duty_pct);
+                Serial.printf("App command queued: type=%u duty=%d%%\n",
+                              (unsigned)cmd.type, cmd.duty_pct);
             }
         }
 
@@ -466,7 +538,7 @@ static void Task_Emergency_Watchdog(void *pvParameters) {
 
         if (bits & EVT_EMERGENCY) {
             setSystemMode(EMERGENCY_MODE);
-            xEventGroupClearBits(sysEvents, EVT_MANUAL_ACTIVE);
+            xEventGroupClearBits(sysEvents, EVT_OPERATOR_ACTIVE);
         }
 
         esp_task_wdt_reset();
@@ -502,7 +574,8 @@ static void Task_Display(void *pvParameters) {
             const char *modeName = "INIT";
             switch (g_sys.current_mode) {
                 case AUTO_MODE: modeName = "AUTO"; break;
-                case MANUAL_MODE: modeName = "MANU"; break;
+                case REMOTE_MODE: modeName = "REM"; break;
+                case OPERATOR_MODE: modeName = "OPER"; break;
                 case EMERGENCY_MODE: modeName = "EMRG"; break;
                 case INIT_MODE:
                 default: modeName = "INIT"; break;

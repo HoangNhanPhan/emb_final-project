@@ -36,7 +36,7 @@ public:
 
     // Các hàm kiểm tra và lấy lệnh điều khiển manual từ MQTT.
     bool hasCommand() const;
-    ManualCommand_t getCommand();
+    ControlCommand_t getCommand();
 
     // Trạng thái kết nối của WiFi và MQTT, dùng cho việc decide system mode.
     bool isConnected() const { return _wifiConnected && _mqttConnected; }
@@ -54,7 +54,7 @@ private:
     uint32_t _lastTelemetryPublish; // Thời điểm publish telemetry lần trước.
     uint32_t _lastMQTTLoop;         // Thời điểm vòng lặp MQTT gần nhất, dùng để throttle loop.
 
-    ManualCommand_t _pendingCommand; // Lệnh điều khiển mới nhất đang chờ xử lý.
+    ControlCommand_t _pendingCommand; // Lệnh điều khiển mới nhất đang chờ xử lý.
     bool _commandAvailable;          // Cờ báo có lệnh chưa đọc từ queue.
 
     const char *_ssid;        // Tên WiFi SSID.
@@ -82,7 +82,7 @@ private:
                               SystemMode_t mode,
                               bool alarm,
                               bool shutdown);
-    bool parseCommandJson(const String &jsonString, ManualCommand_t &cmd);
+    bool parseCommandJson(const String &jsonString, ControlCommand_t &cmd);
 };
 
 #endif // MQTT_HANDLER_H

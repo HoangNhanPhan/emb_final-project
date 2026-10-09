@@ -14,10 +14,9 @@
 #define PIN_I2C_SCL         22      // SCL cho bus I2C AHT20/LCD
 #define PIN_FAN_PWM         25      // PWM quạt 4 dây, LEDC channel 0
 #define PIN_FAN_TACH        26      // Tín hiệu xung tachometer quạt
-#define PIN_SWITCH_LEVEL_0   14      // Switch mức 0% (INPUT_PULLUP)
-#define PIN_SWITCH_LEVEL_33  27      // Switch mức 33% (INPUT_PULLUP)
-#define PIN_SWITCH_LEVEL_66  32      // Switch mức 66% (INPUT_PULLUP)
-#define PIN_SWITCH_LEVEL_100 33      // Switch mức 100% (INPUT_PULLUP)
+#define PIN_OPERATOR_POT     34      // Biến trở Operator, ADC1 input-only
+#define PIN_OPERATOR_TOGGLE  32      // Nút nhấn toggle Operator, INPUT_PULLUP, nhấn nối xuống GND
+#define PIN_OPERATOR_ACTIVATE 33     // Nút Activate Operator, INPUT_PULLUP, nhấn nối xuống GND
 
 // -----------------------------------------------------------------------------
 // Cấu hình PWM quạt.
@@ -25,8 +24,10 @@
 // -----------------------------------------------------------------------------
 #define LEDC_FAN_CHANNEL    0
 #define LEDC_FAN_TIMER      0
-#define LEDC_FAN_RESOLUTION 10   // 10-bit => 1024 mức, phù hợp với PWM 25 kHz.
-#define LEDC_FAN_FREQ_HZ    25000 // Tần số 25 kHz phù hợp với tiêu chuẩn quạt 4 dây, giảm tiếng ồn và tăng độ ổn định.
+#define LEDC_FAN_RESOLUTION 10   // 10-bit => 1024 mức.
+#define LEDC_FAN_FREQ_HZ    25000 // Tần số PWM 25 kHz cho quạt 4 dây.
+#define OPERATOR_ADC_MAX    4095U
+#define OPERATOR_ADC_DEADBAND 16U
 #define FAN_TACH_PULSES_PER_REV 2
 #define MAX_PHYSICAL_RPM    20000
 #define EMA_ALPHA           0.1f
@@ -72,7 +73,7 @@
 #define NETWORK_PERIOD_MS       100UL    // Chu kỳ duy trì kết nối MQTT và xử lý mạng.
 #define MQTT_KEEPALIVE_S        30
 #define MQTT_PUBLISH_PERIOD_MS  5000UL   // Khoảng thời gian publish telemetry lên broker.
-#define MANUAL_TIMEOUT_MS       30000UL  // Nếu hết thời gian mà không có lệnh manual mới, quay về AUTO_MODE.
+#define OPERATOR_TIMEOUT_MS     30000UL  // Hết thời gian Operator thì khóa đầu vào và quay về AUTO_MODE.
 #define I2C_TIMEOUT_MS          2000UL   // Timeout I2C khi sensor không phản hồi, hệ thống quay về AUTO_MODE.
 #define EMERGENCY_REACT_MS      1000UL   // Thời gian tối đa hệ thống phản ứng với sự kiện khẩn cấp.
 #define WDT_TIMEOUT_S           10       // Cửa sổ watchdog phần cứng, nếu task treo sẽ reset.
@@ -117,8 +118,8 @@
 #define EVT_SENSOR_OK           (1UL << 1)
 #define EVT_SENSOR_TIMEOUT      (1UL << 2)
 #define EVT_EMERGENCY           (1UL << 3)
-#define EVT_MANUAL_ACTIVE       (1UL << 4)
-#define EVT_MANUAL_TIMEOUT      (1UL << 5)
+#define EVT_OPERATOR_ACTIVE     (1UL << 4)
+#define EVT_OPERATOR_TIMEOUT   (1UL << 5)
 #define EVT_WDT_FAULT           (1UL << 6)
 
 #endif // CONFIG_H

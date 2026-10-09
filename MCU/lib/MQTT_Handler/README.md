@@ -7,7 +7,7 @@ Non-blocking MQTT client with automatic WiFi/MQTT reconnection.
 - Automatic MQTT reconnection with exponential backoff
 - Non-blocking operation (call update() periodically)
 - Telemetry publishing (SensorData_t -> JSON)
-- Command subscription (JSON -> ManualCommand_t)
+- Command subscription (JSON -> ControlCommand_t)
 - ArduinoJson integration
 - Status monitoring
 
@@ -30,8 +30,8 @@ if (mqtt.isConnected()) {
 
 // Check for commands:
 if (mqtt.hasCommand()) {
-    ManualCommand_t cmd = mqtt.getCommand();
-    // Process cmd.duty_pct (0-100)
+    ControlCommand_t cmd = mqtt.getCommand();
+    // Process the Remote setpoint or Operator action.
 }
 ```
 
@@ -50,7 +50,7 @@ if (mqtt.hasCommand()) {
   "humidity": 60.2,
   "fan_duty": 75,
   "fan_rpm": 1800,
-  "mode": "MANUAL",
+  "mode": "REMOTE",
   "alarm": false,
   "shutdown": false,
   "target_temperature": 30.0,
@@ -60,7 +60,7 @@ if (mqtt.hasCommand()) {
 
 **Commands (subscribed):**
 ```json
-{
-  "duty": 75
-}
+{"duty": 75}
 ```
+
+`duty` sets the Remote fan duty. The physical Activate button on GPIO33 enters Operator mode from Auto or Remote; the App action `{"action":"activate"}` is also supported. In Operator mode, one momentary button on GPIO32 toggles the output ON/OFF on each press. Connect each button between its GPIO and GND. GPIO34 reads the 12-bit potentiometer and maps ADC 0-4095 directly to PWM 0-1023. ADC changes below 16 counts are ignored; 30 seconds without a qualifying adjustment returns the system to Auto. MQTT `on`/`off` actions remain supported too.
