@@ -11,7 +11,9 @@
 #include "config.h"
 #include "state_machine.h"
 #include "../lib/AHT20_Driver/AHT20.h"
+#if ENABLE_NETWORK
 #include "../lib/MQTT_Handler/MQTTHandler.h"
+#endif
 #include "../lib/LCD_Display/LCD_I2C.h"
 
 // Khai báo prototype cho các hàm quản lý hệ thống.
@@ -20,11 +22,13 @@ static void initHardware(void);
 static void manualTimeoutCallback(TimerHandle_t xTimer);
 static void setSystemMode(SystemMode_t newMode);
 static void applyModeAction(SystemMode_t mode);
+static void handleAutoMode(float currentTemp);
 
 static void Task_SensorRead(void *pvParameters);
 static void Task_FanControl(void *pvParameters);
+#if ENABLE_NETWORK
 static void Task_Network(void *pvParameters);
-static void Task_Emergency_Watchdog(void *pvParameters);
+#endif
 static void Task_Display(void *pvParameters);
 
 // Queue dùng để truyền sample mới nhất từ SensorRead sang FanControl.
@@ -34,7 +38,7 @@ static QueueHandle_t telemetryQueue = nullptr;
 static QueueHandle_t cmdQueue = nullptr;
 static EventGroupHandle_t sysEvents = nullptr;
 static TimerHandle_t manualTimer = nullptr;
-static SemaphoreHandle_t i2cMutex = nullptr;
+static SemaphoreHandle_t xI2CMutex = nullptr;
 
 // Trạng thái hệ thống toàn cục: mode đang hoạt động, mức duty hiện tại và trạng thái network.
 static SystemContext_t g_sys = {
@@ -57,7 +61,9 @@ static volatile bool g_operatorActivatePressed = false;
 static volatile uint32_t g_operatorActivateLastMs = 0;
 
 // Đối tượng MQTT dùng để kết nối WiFi/MQTT và nhận lệnh điều khiển từ xa.
+#if ENABLE_NETWORK
 static MQTTHandler mqttHandler;
+#endif
 
 extern "C" {
 // ISR của tín hiệu tachometer quạt: chỉ đếm xung, không báo khẩn cấp trực tiếp.
@@ -101,13 +107,13 @@ void setup() {
     telemetryQueue = xQueueCreate(1, sizeof(SensorData_t));
     cmdQueue = xQueueCreate(CMD_QUEUE_LEN, sizeof(ControlCommand_t));
     sysEvents = xEventGroupCreate();
-    i2cMutex = xSemaphoreCreateMutex();
+    xI2CMutex = xSemaphoreCreateMutex();
 
     configASSERT(sensorQueue != nullptr);
     configASSERT(telemetryQueue != nullptr);
     configASSERT(cmdQueue != nullptr);
     configASSERT(sysEvents != nullptr);
-    configASSERT(i2cMutex != nullptr);
+    configASSERT(xI2CMutex != nullptr);
 
     // Timer dùng để tự động quay lại AUTO_MODE nếu không có lệnh manual mới trong thời gian quy định.
     manualTimer = xTimerCreate(
@@ -119,18 +125,17 @@ void setup() {
     configASSERT(manualTimer != nullptr);
 
     // Tạo các task FreeRTOS với ưu tiên khác nhau để tối ưu hóa thời gian và độ nhạy của firmware.
-    xTaskCreatePinnedToCore(Task_Emergency_Watchdog, "Watchdog",
-                            TASK_STACK_WATCHDOG, nullptr,
-                            TASK_PRIO_WATCHDOG, nullptr, 1);
     xTaskCreatePinnedToCore(Task_FanControl, "FanControl",
                             TASK_STACK_FAN, nullptr,
                             TASK_PRIO_FAN, nullptr, 1);
     xTaskCreatePinnedToCore(Task_SensorRead, "SensorRead",
                             TASK_STACK_SENSOR, nullptr,
                             TASK_PRIO_SENSOR, nullptr, 0);
+#if ENABLE_NETWORK
     xTaskCreatePinnedToCore(Task_Network, "Network",
                             TASK_STACK_NETWORK, nullptr,
                             TASK_PRIO_NETWORK, nullptr, 0);
+#endif
     xTaskCreatePinnedToCore(Task_Display, "Display",
                             TASK_STACK_DISPLAY, nullptr,
                             TASK_PRIO_DISPLAY, nullptr, 0);
@@ -152,6 +157,8 @@ static void initHardware(void) {
     ledcWrite(LEDC_FAN_CHANNEL, 0);
 
     // Tachometer và biến trở Operator.
+    pinMode(PIN_LED_ALERT, OUTPUT);
+    digitalWrite(PIN_LED_ALERT, LOW);
     pinMode(PIN_FAN_TACH, INPUT_PULLUP);
     pinMode(PIN_OPERATOR_TOGGLE, INPUT_PULLUP);
     pinMode(PIN_OPERATOR_ACTIVATE, INPUT_PULLUP);
@@ -178,22 +185,78 @@ static void setSystemMode(SystemMode_t newMode) {
     applyModeAction(newMode);
 }
 
+// Khởi tạo trạng thái ban đầu an toàn cho quạt trong chế độ AUTO
+static bool isFanRunning = false;
+
+// Thuật toán điều khiển quạt cho chế độ AUTO_MODE
+// Kết hợp dải trễ Hysteresis (29.5°C - 30.5°C) và ánh xạ tuyến tính chống kẹt động cơ (25% - 100% PWM)
+static void handleAutoMode(float currentTemp) {
+    if (isnan(currentTemp)) {
+        return;
+    }
+
+    // 1. Cập nhật trạng thái ON/OFF theo dải trễ Hysteresis
+    if (currentTemp >= TEMP_ON_THRESH) {
+        isFanRunning = true;
+    } else if (currentTemp <= TEMP_OFF_THRESH) {
+        isFanRunning = false;
+    }
+    // Nếu nằm trong khoảng (TEMP_OFF_THRESH, TEMP_ON_THRESH), isFanRunning giữ nguyên giá trị trước đó
+
+    // 2. Tính toán duty PWM (10-bit: 0 - 1023)
+    uint16_t duty = 0;
+    if (!isFanRunning) {
+        duty = 0; // Quạt tắt hoàn toàn
+    } else {
+        // Ánh xạ nhiệt độ từ [30.5°C -> 40.0°C] sang [PWM_MIN_DUTY -> PWM_MAX_DUTY]
+        if (currentTemp >= TEMP_MAX_AUTO) {
+            duty = PWM_MAX_DUTY;
+        } else {
+            long mappedDuty = map((long)(currentTemp * 10.0f), 
+                                  (long)(TEMP_ON_THRESH * 10.0f), 
+                                  (long)(TEMP_MAX_AUTO * 10.0f), 
+                                  PWM_MIN_DUTY, 
+                                  PWM_MAX_DUTY);
+            // Bảo vệ chống underflow: khi nhiệt độ giảm vào vùng trễ (29.5 - 30.5°C) mà quạt vẫn đang chạy,
+            // constrain đảm bảo duty không bị tụt xuống dưới PWM_MIN_DUTY gây kẹt động cơ
+            duty = (uint16_t)constrain(mappedDuty, (long)PWM_MIN_DUTY, (long)PWM_MAX_DUTY);
+        }
+    }
+
+    // 3. Xuất PWM và cập nhật trạng thái hệ thống
+    ledcWrite(LEDC_FAN_CHANNEL, duty);
+    g_sys.fan_duty_pct = (uint8_t)round(((float)duty * 100.0f) / (float)PWM_MAX_DUTY);
+}
+
 // Chuyển đổi trạng thái mode thành PWM quạt tương ứng.
 static void applyModeAction(SystemMode_t mode) {
     switch (mode) {
         case INIT_MODE:
+            digitalWrite(PIN_LED_ALERT, LOW);
+            isFanRunning = false;
             ledcWrite(LEDC_FAN_CHANNEL, 0);
+            g_sys.fan_duty_pct = 0;
             break;
 
         case AUTO_MODE:
+            digitalWrite(PIN_LED_ALERT, LOW);
+            if (g_sys.last_sensor_valid) {
+                handleAutoMode(g_sys.last_temperature_c);
+            } else {
+                ledcWrite(LEDC_FAN_CHANNEL, 0);
+                g_sys.fan_duty_pct = 0;
+            }
             break;
 
         case REMOTE_MODE:
         case OPERATOR_MODE:
+            digitalWrite(PIN_LED_ALERT, LOW);
             break;
 
         case EMERGENCY_MODE:
+            digitalWrite(PIN_LED_ALERT, HIGH);
             ledcWrite(LEDC_FAN_CHANNEL, (1UL << LEDC_FAN_RESOLUTION) - 1UL);
+            g_sys.fan_duty_pct = 100;
             break;
 
         default:
@@ -209,28 +272,27 @@ static void manualTimeoutCallback(TimerHandle_t xTimer) {
     }
 }
 
-// Task đọc sensor: khởi tạo AHT20, đọc dữ liệu định kỳ, publish lên queue cho FanControl.
+// Task đọc sensor: giữ xI2CMutex trong TOÀN BỘ chu trình đo AHT20
+// (trigger 0xAC -> chờ ~80ms chuyển đổi -> đọc 6 byte) để LCD không chen vào bus.
 static void Task_SensorRead(void *pvParameters) {
     (void)pvParameters;
     TickType_t xLastWakeTime = xTaskGetTickCount();
     static AHT20 sensor(Wire);
-    static bool sensorInitialized = false;
-
-    if (!sensorInitialized) {
-        xSemaphoreTake(i2cMutex, portMAX_DELAY);
-        sensorInitialized = sensor.begin();
-        xSemaphoreGive(i2cMutex);
-        if (!sensorInitialized) {
-            xEventGroupSetBits(sysEvents, EVT_SENSOR_TIMEOUT);
-        }
-    }
+    bool sensorInitialized = false;
 
     for (;;) {
         bool sensorUpdated = false;
-        if (sensorInitialized) {
-            xSemaphoreTake(i2cMutex, portMAX_DELAY);
-            sensorUpdated = sensor.update();
-            xSemaphoreGive(i2cMutex);
+
+        if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(I2C_TIMEOUT_MS)) == pdTRUE) {
+            if (!sensorInitialized) {
+                sensorInitialized = sensor.begin();
+            }
+            if (sensorInitialized) {
+                sensor.triggerMeasurement();
+                vTaskDelay(pdMS_TO_TICKS(85));  // Chờ cảm biến chuyển đổi, vẫn giữ Mutex.
+                sensorUpdated = sensor.readData();
+            }
+            xSemaphoreGive(xI2CMutex);
         }
 
         if (sensorUpdated) {
@@ -258,15 +320,9 @@ static void Task_SensorRead(void *pvParameters) {
             } else {
                 xEventGroupSetBits(sysEvents, EVT_SENSOR_TIMEOUT);
             }
-        } else if (!sensorInitialized) {
-            if (xTaskGetTickCount() % 5000 == 0) {
-                xSemaphoreTake(i2cMutex, portMAX_DELAY);
-                sensorInitialized = sensor.begin();
-                xSemaphoreGive(i2cMutex);
-                if (sensorInitialized) {
-                    xEventGroupClearBits(sysEvents, EVT_SENSOR_TIMEOUT);
-                }
-            }
+        } else {
+            g_sys.last_sensor_valid = false;
+            xEventGroupSetBits(sysEvents, EVT_SENSOR_TIMEOUT);
         }
 
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(SENSOR_READ_PERIOD_MS));
@@ -282,11 +338,15 @@ static void Task_FanControl(void *pvParameters) {
     static uint32_t lastPIDTime = 0;
     static float targetTemp = TARGET_TEMP_DEFAULT_C;
     static float emaRpm = 0.0f;
+    static float emaAdc = 0.0f;
     static uint16_t acceptedOperatorAdc = 0;
     static uint32_t operatorPwmValue = 0;
     static bool operatorAdcInitialized = false;
     static bool operatorEnabled = true;
     g_sys.target_temp_c = targetTemp;
+
+    // Đăng ký task điều khiển chính vào Task WDT (timeout 5s, đặt ở initHardware).
+    esp_task_wdt_add(NULL);
 
     for (;;) {
         EventBits_t bits = xEventGroupGetBits(sysEvents);
@@ -295,14 +355,12 @@ static void Task_FanControl(void *pvParameters) {
             g_sys.fan_duty_pct = 100;
         } else if (bits & EVT_OPERATOR_TIMEOUT) {
             setSystemMode(AUTO_MODE);
-            g_sys.fan_duty_pct = 0;
             operatorAdcInitialized = false;
             xEventGroupClearBits(sysEvents, EVT_OPERATOR_TIMEOUT | EVT_OPERATOR_ACTIVE);
             xTimerStop(manualTimer, 0);
         } else if (g_sys.current_mode == REMOTE_MODE &&
                    (!(bits & EVT_NETWORK_READY) || (bits & EVT_SENSOR_TIMEOUT))) {
             setSystemMode(AUTO_MODE);
-            g_sys.fan_duty_pct = 0;
         } else if (g_sys.current_mode == INIT_MODE) {
             setSystemMode(AUTO_MODE);
         }
@@ -349,7 +407,6 @@ static void Task_FanControl(void *pvParameters) {
                     break;
                 case COMMAND_RETURN_AUTO:
                     setSystemMode(AUTO_MODE);
-                    g_sys.fan_duty_pct = 0;
                     operatorAdcInitialized = false;
                     xTimerStop(manualTimer, 0);
                     xEventGroupClearBits(sysEvents, EVT_OPERATOR_ACTIVE | EVT_OPERATOR_TIMEOUT);
@@ -387,12 +444,12 @@ static void Task_FanControl(void *pvParameters) {
 
         if (g_sys.current_mode == EMERGENCY_MODE) {
             g_sys.fan_duty_pct = 100;
-            if (g_sys.last_sensor_valid && g_sys.last_temperature_c <= TEMP_MIN_C &&
+            // Thoát khi nhiệt độ đã hạ xuống ngưỡng an toàn và độ ẩm trong giới hạn.
+            if (g_sys.last_sensor_valid && g_sys.last_temperature_c <= TEMP_EMERGENCY_EXIT_C &&
                 g_sys.last_humidity_pct <= HUM_CRITICAL_HIGH &&
                 g_sys.last_humidity_pct >= HUM_CRITICAL_LOW) {
                 xEventGroupClearBits(sysEvents, EVT_EMERGENCY);
-                setSystemMode(AUTO_MODE);
-                g_sys.fan_duty_pct = 0;
+                setSystemMode(AUTO_MODE);  // applyModeAction tắt LED và áp dụng lại AUTO.
             }
         }
 
@@ -406,53 +463,54 @@ static void Task_FanControl(void *pvParameters) {
         emaRpm = EMA_ALPHA * boundedRpm + (1.0f - EMA_ALPHA) * emaRpm;
         g_sys.fan_rpm = (uint16_t)emaRpm;
 
-        if (xQueueReceive(sensorQueue, &data, 0) == pdTRUE && data.valid &&
-            millis() - lastPIDTime >= 200 && g_sys.current_mode == AUTO_MODE) {
-            lastPIDTime = millis();
-            const float temperatureDelta = data.temperature_c - targetTemp;
-            const float requestedDuty = temperatureDelta * FAN_DUTY_PER_DEGREE_PCT;
-            uint8_t duty;
-            if (requestedDuty <= 0.5f) {
-                duty = 0;
-            } else if (requestedDuty < FAN_STALL_DUTY_PCT) {
-                duty = FAN_STALL_DUTY_PCT;
-            } else {
-                duty = (uint8_t)constrain(requestedDuty, 0.0f, 100.0f);
+        if (xQueueReceive(sensorQueue, &data, 0) == pdTRUE && data.valid) {
+            if (millis() - lastPIDTime >= 200 && g_sys.current_mode == AUTO_MODE) {
+                lastPIDTime = millis();
+                handleAutoMode(data.temperature_c);
             }
-            g_sys.fan_duty_pct = duty;
         }
 
         const uint32_t pwmMax = (1UL << LEDC_FAN_RESOLUTION) - 1UL;
-        uint32_t pwmValue;
         if (g_sys.current_mode == OPERATOR_MODE) {
-            const uint16_t adcValue = (uint16_t)constrain(
+            const uint16_t adcRaw = (uint16_t)constrain(
                 analogRead(PIN_OPERATOR_POT), 0, (int)OPERATOR_ADC_MAX);
+            // Lọc EMA để triệt gai nhiễu ADC.
+            if (!operatorAdcInitialized) {
+                emaAdc = (float)adcRaw;
+            } else {
+                emaAdc = OPERATOR_ADC_EMA_ALPHA * (float)adcRaw +
+                         (1.0f - OPERATOR_ADC_EMA_ALPHA) * emaAdc;
+            }
+            const uint16_t adcValue = (uint16_t)emaAdc;
             const uint16_t adcDelta = adcValue > acceptedOperatorAdc
                 ? adcValue - acceptedOperatorAdc
                 : acceptedOperatorAdc - adcValue;
             if (!operatorAdcInitialized || adcDelta >= OPERATOR_ADC_DEADBAND) {
                 acceptedOperatorAdc = adcValue;
-                operatorPwmValue = (uint32_t)map(
-                    adcValue, 0, OPERATOR_ADC_MAX, 0, (long)pwmMax);
+                operatorPwmValue = (uint32_t)(adcValue >> 2);  // 12-bit -> 10-bit
+                if (operatorPwmValue > pwmMax) operatorPwmValue = pwmMax;
                 operatorAdcInitialized = true;
                 xTimerReset(manualTimer, portMAX_DELAY);
                 xTimerStart(manualTimer, portMAX_DELAY);
             }
-            pwmValue = operatorEnabled ? operatorPwmValue : 0;
+            uint32_t pwmValue = operatorEnabled ? operatorPwmValue : 0;
             g_sys.fan_duty_pct = (uint8_t)((pwmValue * 100UL) / pwmMax);
-        } else {
+            ledcWrite(LEDC_FAN_CHANNEL, pwmValue);
+        } else if (g_sys.current_mode != AUTO_MODE) {
             const uint8_t duty = g_sys.fan_duty_pct;
-            pwmValue = duty == 0
+            uint32_t pwmValue = duty == 0
                 ? 0
                 : (uint32_t)map(duty, 0, 100, 0, (int)pwmMax);
+            ledcWrite(LEDC_FAN_CHANNEL, pwmValue);
         }
-        ledcWrite(LEDC_FAN_CHANNEL, pwmValue);
 
+        esp_task_wdt_reset();  // Nuôi WDT ở cuối chu kỳ; kẹt >5s sẽ tự reset ESP32.
         vTaskDelay(pdMS_TO_TICKS(FAN_UPDATE_PERIOD_MS));
     }
 }
 
 // Task network: duy trì kết nối WiFi/MQTT, nhận lệnh manual và publish telemetry.
+#if ENABLE_NETWORK
 static void Task_Network(void *pvParameters) {
     (void)pvParameters;
     static bool mqttInitialized = false;
@@ -522,34 +580,14 @@ static void Task_Network(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(NETWORK_PERIOD_MS));
     }
 }
-
-// Task watchdog: theo dõi các sự kiện cảnh báo an toàn và chuyển hệ thống về trạng thái thích hợp.
-static void Task_Emergency_Watchdog(void *pvParameters) {
-    (void)pvParameters;
-    esp_task_wdt_add(nullptr);
-
-    for (;;) {
-        EventBits_t bits = xEventGroupWaitBits(
-            sysEvents,
-            EVT_EMERGENCY | EVT_WDT_FAULT,
-            pdTRUE,
-            pdFALSE,
-            pdMS_TO_TICKS(2000));
-
-        if (bits & EVT_EMERGENCY) {
-            setSystemMode(EMERGENCY_MODE);
-            xEventGroupClearBits(sysEvents, EVT_OPERATOR_ACTIVE);
-        }
-
-        esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(EMERGENCY_REACT_MS));
-    }
-}
+#endif  // ENABLE_NETWORK
 
 static void Task_Display(void *pvParameters) {
     (void)pvParameters;
+    xSemaphoreTake(xI2CMutex, portMAX_DELAY);
     lcdInit(LCD_I2C_ADDR);
     lcdBacklight(true);
+    xSemaphoreGive(xI2CMutex);
 
     uint32_t lastPageChange = millis();
     bool showMode = false;
@@ -596,12 +634,12 @@ static void Task_Display(void *pvParameters) {
         }
         line1[LCD_COLS] = '\0';
 
-        if (xSemaphoreTake(i2cMutex, 0) == pdTRUE) {
+        if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
             lcdSetCursor(0, 0);
             lcdPrint(line0);
             lcdSetCursor(0, 1);
             lcdPrint(line1);
-            xSemaphoreGive(i2cMutex);
+            xSemaphoreGive(xI2CMutex);
         }
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_UPDATE_PERIOD_MS));
     }

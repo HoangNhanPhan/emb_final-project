@@ -1,0 +1,61 @@
+#include <Arduino.h>
+
+#define ACTIVATE_PIN 18 
+
+enum SystemState { AUTO, REMOTE, OPERATOR, EMERGENCY };
+volatile SystemState currentState = AUTO;
+
+SemaphoreHandle_t xActivateSemaphore;
+
+// ISR chỉ bắt sườn xuống (FALLING)
+void IRAM_ATTR activateISR() {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(xActivateSemaphore, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+void vActivateTask(void *pvParameters) {
+    for (;;) {
+        if (xSemaphoreTake(xActivateSemaphore, portMAX_DELAY) == pdTRUE) {
+            
+            // 1. Debounce: Chờ 20ms 
+            vTaskDelay(pdMS_TO_TICKS(20));
+
+            // 2. Rút cạn Semaphore thừa do dội phím sinh ra
+            while(xSemaphoreTake(xActivateSemaphore, 0) == pdTRUE) {}
+
+            // 3. Đọc lại chân. Nếu vẫn là LOW (đích thị người dùng đang nhấn, không phải nhiễu)
+            if (digitalRead(ACTIVATE_PIN) == LOW) {
+                // Đảo trạng thái logic (Toggle)
+                if (currentState == OPERATOR) {
+                    currentState = AUTO; // Nhấn lần 2 để thoát Operator
+                    Serial.println("[MODE] Thoát thủ công -> Chuyển về: AUTO");
+                } else {
+                    currentState = OPERATOR; // Nhấn lần 1 để chiếm quyền
+                    Serial.println("[MODE] Kích hoạt thủ công -> Chuyển sang: OPERATOR");
+                }
+            }
+            
+            // Lưu ý: Khi người dùng nhả tay ra (chân nảy lên HIGH), hệ thống sẽ bỏ qua
+            // vì ISR chỉ kích hoạt khi FALLING.
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(ACTIVATE_PIN, INPUT_PULLUP);
+    xActivateSemaphore = xSemaphoreCreateBinary();
+
+    if (xActivateSemaphore != NULL) {
+        xTaskCreate(vActivateTask, "Activate_Task", 2048, NULL, 5, NULL);
+        // THAY ĐỔI QUAN TRỌNG: Chỉ bắt sườn xuống
+        attachInterrupt(digitalPinToInterrupt(ACTIVATE_PIN), activateISR, FALLING);
+    }
+}
+
+void loop() {
+    vTaskDelete(NULL); 
+}
