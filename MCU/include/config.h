@@ -44,6 +44,8 @@
 #define LEDC_FAN_FREQ_HZ 25000 // Tần số PWM 25 kHz cho quạt 4 dây.
 #define OPERATOR_ADC_MAX 4095U
 #define OPERATOR_ADC_DEADBAND 20U
+#define OPERATOR_ACTIVITY_THRESHOLD 150U // Mức xoay biến trở tối thiểu để gia hạn timeout Operator (~3.7%)
+#define TACH_MIN_PULSE_INTERVAL_US 1000UL // Bỏ xung tach đến sát hơn 1ms (nhiễu)
 #define OPERATOR_ADC_EMA_ALPHA 0.18f // Hệ số lọc EMA cho biến trở (0.15 - 0.2)
 #define FAN_TACH_PULSES_PER_REV 2
 #define MAX_PHYSICAL_RPM 20000

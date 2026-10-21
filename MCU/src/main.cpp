@@ -54,6 +54,7 @@ static SystemContext_t g_sys = {
 
 static volatile uint32_t g_tachPulseCount = 0;
 static volatile uint32_t g_lastTachPulseMs = 0;
+static volatile uint32_t g_lastTachPulseUs = 0;
 static portMUX_TYPE g_operatorButtonMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool g_operatorButtonPressed = false;
 static volatile uint32_t g_operatorButtonLastMs = 0;
@@ -68,10 +69,14 @@ static MQTTHandler mqttHandler;
 extern "C" {
 // ISR của tín hiệu tachometer quạt: chỉ đếm xung, không báo khẩn cấp trực tiếp.
 static void IRAM_ATTR gpio_isr_handler() {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    // Lọc nhiễu: bỏ qua xung đến quá sát xung trước (nhiễu PWM 25kHz ghép vào tach).
+    const uint32_t nowUs = micros();
+    if ((uint32_t)(nowUs - g_lastTachPulseUs) < TACH_MIN_PULSE_INTERVAL_US) {
+        return;
+    }
+    g_lastTachPulseUs = nowUs;
     g_tachPulseCount++;
-    g_lastTachPulseMs = millis();
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    g_lastTachPulseMs = nowUs / 1000UL;
 }
 
 static void IRAM_ATTR operatorButton_isr() {
@@ -338,6 +343,8 @@ static void Task_FanControl(void *pvParameters) {
     static uint32_t lastPIDTime = 0;
     static float targetTemp = TARGET_TEMP_DEFAULT_C;
     static float emaRpm = 0.0f;
+    static uint32_t lastRpmMs = millis();
+    static uint16_t activityAdc = 0;
     static float emaAdc = 0.0f;
     static uint16_t acceptedOperatorAdc = 0;
     static uint32_t operatorPwmValue = 0;
@@ -434,9 +441,10 @@ static void Task_FanControl(void *pvParameters) {
         }
 
         const uint32_t nowMs = millis();
+        const uint32_t lastPulseMs = (uint32_t)(g_lastTachPulseUs / 1000UL);
         if (g_sys.current_mode != INIT_MODE &&
             g_sys.fan_duty_pct > FAN_STALL_DUTY_PCT &&
-            (nowMs - g_lastTachPulseMs) > 2000UL) {
+            (nowMs - lastPulseMs) > 2000UL) {
             setSystemMode(EMERGENCY_MODE);
             g_sys.fan_duty_pct = 100;
             xEventGroupSetBits(sysEvents, EVT_EMERGENCY);
@@ -457,10 +465,15 @@ static void Task_FanControl(void *pvParameters) {
         const uint32_t pulses = g_tachPulseCount;
         g_tachPulseCount = 0;
         interrupts();
-        const float rpm = (pulses * 60000.0f) /
-                          (FAN_TACH_PULSES_PER_REV * FAN_UPDATE_PERIOD_MS);
-        const float boundedRpm = rpm > MAX_PHYSICAL_RPM ? 0.0f : rpm;
-        emaRpm = EMA_ALPHA * boundedRpm + (1.0f - EMA_ALPHA) * emaRpm;
+        const uint32_t rpmNowMs = millis();
+        const uint32_t elapsedMs = rpmNowMs - lastRpmMs;
+        lastRpmMs = rpmNowMs;
+        const float rpm = elapsedMs == 0 ? emaRpm
+            : (pulses * 60000.0f) / (FAN_TACH_PULSES_PER_REV * (float)elapsedMs);
+        // Mẫu vượt giới hạn vật lý là nhiễu: bỏ qua thay vì ép về 0 (làm RPM tụt).
+        if (rpm <= MAX_PHYSICAL_RPM) {
+            emaRpm = EMA_ALPHA * rpm + (1.0f - EMA_ALPHA) * emaRpm;
+        }
         g_sys.fan_rpm = (uint16_t)emaRpm;
 
         if (xQueueReceive(sensorQueue, &data, 0) == pdTRUE && data.valid) {
@@ -489,7 +502,17 @@ static void Task_FanControl(void *pvParameters) {
                 acceptedOperatorAdc = adcValue;
                 operatorPwmValue = (uint32_t)(adcValue >> 2);  // 12-bit -> 10-bit
                 if (operatorPwmValue > pwmMax) operatorPwmValue = pwmMax;
+                if (!operatorAdcInitialized) {
+                    activityAdc = adcValue;
+                }
                 operatorAdcInitialized = true;
+            }
+            // Chỉ gia hạn timeout khi người dùng thực sự xoay biến trở (vượt ngưỡng lớn),
+            // tránh nhiễu ADC liên tục reset timer.
+            const uint16_t activityDelta = adcValue > activityAdc
+                ? adcValue - activityAdc : activityAdc - adcValue;
+            if (activityDelta >= OPERATOR_ACTIVITY_THRESHOLD) {
+                activityAdc = adcValue;
                 xTimerReset(manualTimer, portMAX_DELAY);
                 xTimerStart(manualTimer, portMAX_DELAY);
             }
