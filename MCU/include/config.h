@@ -20,7 +20,7 @@
   5 // Nút On/Off tại chỗ (BTN_ONOFF), INPUT_PULLUP, nhấn nối xuống GND
 #define PIN_OPERATOR_ACTIVATE                                                  \
   23 // Nút Activate Operator (BTN_ACTIVATE), INPUT_PULLUP, nhấn nối xuống GND
-#define PIN_LED_ALERT 2     // LED cảnh báo, HIGH khi EMERGENCY
+#define PIN_LED_ALERT 2 // LED cảnh báo, HIGH khi EMERGENCY
 
 // Alias theo tên trong tài liệu đặc tả.
 #define FAN_PWM_PIN PIN_FAN_PWM
@@ -44,8 +44,10 @@
 #define LEDC_FAN_FREQ_HZ 25000 // Tần số PWM 25 kHz cho quạt 4 dây.
 #define OPERATOR_ADC_MAX 4095U
 #define OPERATOR_ADC_DEADBAND 20U
-#define OPERATOR_ACTIVITY_THRESHOLD 150U // Mức xoay biến trở tối thiểu để gia hạn timeout Operator (~3.7%)
-#define TACH_MIN_PULSE_INTERVAL_US 1000UL // Bỏ xung tach đến sát hơn 1ms (nhiễu)
+#define OPERATOR_ACTIVITY_THRESHOLD                                            \
+  150U // Mức xoay biến trở tối thiểu để gia hạn timeout Operator (~3.7%)
+#define TACH_MIN_PULSE_INTERVAL_US                                             \
+  1000UL                             // Bỏ xung tach đến sát hơn 1ms (nhiễu)
 #define OPERATOR_ADC_EMA_ALPHA 0.18f // Hệ số lọc EMA cho biến trở (0.15 - 0.2)
 #define FAN_TACH_PULSES_PER_REV 2
 #define MAX_PHYSICAL_RPM 20000
@@ -86,8 +88,8 @@
 #define TEMP_ON_THRESH 30.5f  // Ngưỡng bật trong AUTO_MODE (dải trễ Hysteresis)
 #define TEMP_MAX_AUTO 40.0f   // Nhiệt độ đạt 100% công suất trong AUTO_MODE
 
-#define PWM_MIN_DUTY 256      // 25% của 1023 (tránh kẹt động cơ quạt 10-bit)
-#define PWM_MAX_DUTY 1023     // 100% công suất (10-bit resolution)
+#define PWM_MIN_DUTY 256  // 25% của 1023 (tránh kẹt động cơ quạt 10-bit)
+#define PWM_MAX_DUTY 1023 // 100% công suất (10-bit resolution)
 #define TEMP_EMERGENCY_EXIT_C 35.0f // Hạ xuống ngưỡng này thì thoát EMERGENCY
 
 // -----------------------------------------------------------------------------
@@ -115,7 +117,7 @@
 #define MQTT_PUBLISH_PERIOD_MS                                                 \
   5000UL // Khoảng thời gian publish telemetry lên broker.
 #define OPERATOR_TIMEOUT_MS                                                    \
-  30000UL // Hết thời gian Operator thì khóa đầu vào và quay về AUTO_MODE.
+  20000UL // Hết thời gian Operator thì khóa đầu vào và quay về AUTO_MODE.
 #define I2C_TIMEOUT_MS                                                         \
   2000UL // Timeout I2C khi sensor không phản hồi, hệ thống quay về AUTO_MODE.
 #define EMERGENCY_REACT_MS                                                     \
